@@ -1,10 +1,11 @@
+use asset_agnostic_orderbook::state::{orderbook::CallbackInfo, OrderSummary};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytemuck::{try_cast_slice_mut, try_from_bytes_mut, Pod, Zeroable};
 use num_derive::{FromPrimitive, ToPrimitive};
 use solana_program::{
     account_info::AccountInfo, msg, program_error::ProgramError, program_pack::Pack, pubkey::Pubkey,
 };
-use std::{cell::RefMut, mem::size_of};
+use std::{cell::RefMut, convert::TryInto, mem::size_of};
 
 use crate::{
     error::DexError,
@@ -51,17 +52,17 @@ pub struct DexState {
     /// This u64 is used to verify and version the dex state
     pub tag: u64,
     /// The mint key of the base token
-    pub base_mint: [u8; 32],
+    pub base_mint: Pubkey,
     /// The mint key of the quote token
-    pub quote_mint: [u8; 32],
+    pub quote_mint: Pubkey,
     /// The SPL token account holding the market's base tokens
-    pub base_vault: [u8; 32],
+    pub base_vault: Pubkey,
     /// The SPL token account holding the market's quote tokens
-    pub quote_vault: [u8; 32],
+    pub quote_vault: Pubkey,
     /// The asset agnostic orderbook address
-    pub orderbook: [u8; 32],
+    pub orderbook: Pubkey,
     /// The market admin which can recuperate all transaction fees
-    pub admin: [u8; 32],
+    pub admin: Pubkey,
     /// The market's creation timestamp on the Solana runtime clock.
     pub creation_timestamp: i64,
     /// The market's total historical volume in base token
@@ -72,6 +73,14 @@ pub struct DexState {
     pub accumulated_fees: u64,
     /// The market's minimum allowed order size in base token amount
     pub min_base_order_size: u64,
+    /// Royalties bps
+    pub royalties_bps: u64,
+    /// Accumulated royalties fees
+    pub accumulated_royalties: u64,
+    /// The base currency multiplier
+    pub base_currency_multiplier: u64,
+    /// The quote currency multiplier
+    pub quote_currency_multiplier: u64,
     /// The signer nonce is necessary for the market to perform as a signing entity
     pub signer_nonce: u8,
     /// Fee type (e.g. default or stable)
@@ -100,6 +109,41 @@ impl DexState {
         });
         a
     }
+
+    pub(crate) fn scale_quote_amount(&self, raw_quote_amount: u64) -> u64 {
+        raw_quote_amount / self.quote_currency_multiplier
+    }
+
+    pub(crate) fn scale_base_amount(&self, raw_base_amount: u64) -> u64 {
+        raw_base_amount / self.base_currency_multiplier
+    }
+
+    pub(crate) fn unscale_quote_amount(&self, scaled_quote_amount: u64) -> Option<u64> {
+        scaled_quote_amount.checked_mul(self.quote_currency_multiplier)
+    }
+
+    pub(crate) fn unscale_base_amount(&self, scaled_base_amount: u64) -> Option<u64> {
+        scaled_base_amount.checked_mul(self.base_currency_multiplier)
+    }
+
+    pub(crate) fn unscale_order_summary(&self, order_summary: &mut OrderSummary) -> Option<()> {
+        order_summary.total_base_qty = self.unscale_base_amount(order_summary.total_base_qty)?;
+        order_summary.total_base_qty_posted =
+            self.unscale_base_amount(order_summary.total_base_qty_posted)?;
+        order_summary.total_quote_qty = self.unscale_quote_amount(order_summary.total_quote_qty)?;
+        Some(())
+    }
+
+    pub(crate) fn get_quote_from_base(
+        &self,
+        raw_base_amount: u64,
+        scaled_price_fp32: u64,
+    ) -> Option<u64> {
+        fp32_mul(raw_base_amount, scaled_price_fp32)
+            .and_then(|n| (n as u128).checked_mul(self.quote_currency_multiplier as u128))
+            .and_then(|n| n.checked_div(self.base_currency_multiplier as u128))
+            .and_then(|n| n.try_into().ok())
+    }
 }
 
 /// This header describes a user account's state
@@ -109,9 +153,9 @@ pub struct UserAccountHeader {
     /// This byte is used to verify and version the dex state
     pub tag: u64,
     /// The user account's assocatied DEX market
-    pub market: [u8; 32],
+    pub market: Pubkey,
     /// The user account owner's wallet
-    pub owner: [u8; 32],
+    pub owner: Pubkey,
     /// The amount of base token available for settlement
     pub base_token_free: u64,
     /// The amount of base token currently locked in the orderbook
@@ -150,13 +194,13 @@ pub struct Order {
 
 impl Order {
     /// The length in bytes of the order's binary representation
-    pub const LEN: usize = 32;
+    pub const LEN: usize = std::mem::size_of::<Self>();
 }
 
 #[allow(missing_docs)]
 pub struct UserAccount<'a> {
-    pub header: RefMut<'a, UserAccountHeader>,
-    orders: RefMut<'a, [Order]>,
+    pub header: &'a mut UserAccountHeader,
+    orders: &'a mut [Order],
 }
 
 /// Size in bytes of the user account header object
@@ -166,8 +210,8 @@ impl UserAccountHeader {
     pub(crate) fn new(market: &Pubkey, owner: &Pubkey) -> Self {
         Self {
             tag: AccountTag::UserAccount as u64,
-            market: market.to_bytes(),
-            owner: owner.to_bytes(),
+            market: *market,
+            owner: *owner,
             base_token_free: 0,
             base_token_locked: 0,
             quote_token_free: 0,
@@ -184,26 +228,22 @@ impl UserAccountHeader {
 }
 
 impl<'a> UserAccount<'a> {
-    pub(crate) fn get<'b: 'a>(account_info: &'a AccountInfo<'b>) -> Result<Self, ProgramError> {
-        let a = Self::get_unchecked(account_info);
-        if a.header.tag != AccountTag::UserAccount as u64 {
+    #[allow(missing_docs)]
+    pub fn from_buffer(buf: &'a mut [u8]) -> Result<Self, ProgramError> {
+        let user_acc = UserAccount::from_buffer_unchecked(buf).unwrap();
+        if user_acc.header.tag != AccountTag::UserAccount as u64 {
             return Err(ProgramError::InvalidAccountData);
         };
-        Ok(a)
+        Ok(user_acc)
     }
 
-    pub(crate) fn get_unchecked<'b: 'a>(account_info: &'a AccountInfo<'b>) -> Self {
-        let a = RefMut::map_split(account_info.data.borrow_mut(), |s| {
-            let (hd, tl) = s.split_at_mut(USER_ACCOUNT_HEADER_LEN);
-            (
-                try_from_bytes_mut(hd).unwrap(),
-                try_cast_slice_mut(tl).unwrap(),
-            )
-        });
-        Self {
-            header: a.0,
-            orders: a.1,
-        }
+    #[allow(missing_docs)]
+    pub fn from_buffer_unchecked(buf: &'a mut [u8]) -> Result<Self, ProgramError> {
+        let (hd, tl) = buf.split_at_mut(USER_ACCOUNT_HEADER_LEN);
+        let header: &mut UserAccountHeader = try_from_bytes_mut(hd).unwrap();
+        let orders = try_cast_slice_mut(tl).unwrap();
+
+        Ok(Self { header, orders })
     }
 }
 
@@ -248,6 +288,21 @@ impl<'a> UserAccount<'a> {
             .find(|(_, b)| b.id == order_id)
             .ok_or(DexError::OrderNotFound)?
             .0;
+        Ok(res)
+    }
+
+    #[allow(missing_docs)]
+    pub fn find_order_id_and_index_by_client_id(
+        &self,
+        client_order_id: u128,
+    ) -> Result<(u64, u128), DexError> {
+        let res = self
+            .orders
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.client_id == client_order_id)
+            .map(|(idx, b)| (idx as u64, b.id))
+            .ok_or(DexError::OrderNotFound)?;
         Ok(res)
     }
 }
@@ -375,9 +430,20 @@ impl FeeTier {
         fp32_mul(quote_qty, rate).unwrap()
     }
 }
-#[doc(hidden)]
-#[derive(BorshDeserialize, BorshSerialize, Debug)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone, Copy, Zeroable, Pod, PartialEq)]
+#[repr(C)]
+/// Information about a user involved in an orderbook matching event
 pub struct CallBackInfo {
+    #[allow(missing_docs)]
     pub user_account: Pubkey,
+    #[allow(missing_docs)]
     pub fee_tier: u8,
+}
+
+impl CallbackInfo for CallBackInfo {
+    type CallbackId = Pubkey;
+
+    fn as_callback_id(&self) -> &Self::CallbackId {
+        &self.user_account
+    }
 }

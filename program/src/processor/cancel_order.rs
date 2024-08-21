@@ -1,20 +1,18 @@
 //! Cancel an existing order and remove it from the orderbook.
-use std::rc::Rc;
-
 use crate::{
     error::DexError,
-    state::{DexState, UserAccount},
+    state::{CallBackInfo, DexState, UserAccount},
     utils::{check_account_key, check_account_owner, check_signer},
 };
-use agnostic_orderbook::{
+use asset_agnostic_orderbook::{
     error::AoError,
-    state::{get_side_from_order_id, EventQueue, EventQueueHeader, OrderSummary, Side},
+    state::{get_side_from_order_id, Side},
 };
 use bonfida_utils::BorshSize;
 use bonfida_utils::InstructionsAccount;
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
-use bytemuck::{try_from_bytes, Pod, Zeroable};
+use bytemuck::{CheckedBitPattern, NoUninit};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -23,19 +21,22 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
-use super::CALLBACK_INFO_LEN;
-
-#[derive(Clone, Copy, Zeroable, Pod, BorshDeserialize, BorshSerialize, BorshSize)]
+#[derive(Clone, Copy, CheckedBitPattern, NoUninit, BorshDeserialize, BorshSerialize, BorshSize)]
 #[repr(C)]
 /**
 The required arguments for a cancel_order instruction.
 */
 pub struct Params {
-    /// The index in the user account of the order to cancel
-    pub order_index: u64,
     /// The order_id of the order to cancel. Redundancy is used here to avoid having to iterate over all
     /// open orders on chain.
     pub order_id: u128,
+    /// The index in the user account of the order to cancel
+    pub order_index: u64,
+    /// Decide wether the `order_id` param is the order id from the user account or a client_order_id which was
+    /// given by the user on creation.
+    /// The latter means the order_index param will be ignored.
+    pub is_client_id: bool,
+    pub _padding: [u8; 7],
 }
 
 #[derive(InstructionsAccount)]
@@ -93,13 +94,16 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         Ok(a)
     }
 
-    pub fn load_user_account(&self) -> Result<UserAccount<'a>, ProgramError> {
-        let user_account = UserAccount::get(self.user)?;
-        if user_account.header.owner != self.user_owner.key.to_bytes() {
+    pub fn load_user_account(
+        &self,
+        user_account_data: &'a mut [u8],
+    ) -> Result<UserAccount<'a>, ProgramError> {
+        let user_account = UserAccount::from_buffer(user_account_data)?;
+        if &user_account.header.owner != self.user_owner.key {
             msg!("Invalid user account owner provided!");
             return Err(ProgramError::InvalidArgument);
         }
-        if user_account.header.market != self.market.key.to_bytes() {
+        if &user_account.header.market != self.market.key {
             msg!("The provided user account doesn't match the current market");
             return Err(ProgramError::InvalidArgument);
         };
@@ -112,57 +116,58 @@ pub(crate) fn process(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let params =
-        try_from_bytes(instruction_data).map_err(|_| ProgramError::InvalidInstructionData)?;
+    let params = bytemuck::checked::try_from_bytes(instruction_data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
     let accounts = Accounts::parse(program_id, accounts)?;
 
     let Params {
-        order_index,
-        order_id,
+        mut order_id,
+        mut order_index,
+        is_client_id,
+        _padding,
     } = params;
 
     let market_state = DexState::get(accounts.market)?;
-    let mut user_account = accounts.load_user_account()?;
+    let mut user_account_data = accounts.user.data.borrow_mut();
+    let mut user_account = accounts.load_user_account(&mut user_account_data)?;
 
     check_accounts(&market_state, &accounts).unwrap();
 
-    let order_id_from_index = user_account.read_order(*order_index as usize)?.id;
-
-    if order_id != &order_id_from_index {
-        msg!("Order id does not match with the order at the given index!");
-        return Err(ProgramError::InvalidArgument);
+    if *is_client_id {
+        (order_index, order_id) = user_account
+            .find_order_id_and_index_by_client_id(order_id)
+            .unwrap();
+    } else {
+        let order_id_from_index = user_account.read_order(order_index as usize)?.id;
+        if order_id != order_id_from_index {
+            msg!("Order id does not match with the order at the given index!");
+            return Err(ProgramError::InvalidArgument);
+        }
     }
 
-    let invoke_params = agnostic_orderbook::instruction::cancel_order::Params {
-        order_id: *order_id,
-    };
-    let invoke_accounts = agnostic_orderbook::instruction::cancel_order::Accounts {
+    let invoke_params = asset_agnostic_orderbook::instruction::cancel_order::Params { order_id };
+    let invoke_accounts = asset_agnostic_orderbook::instruction::cancel_order::Accounts {
         market: accounts.orderbook,
         event_queue: accounts.event_queue,
         bids: accounts.bids,
         asks: accounts.asks,
     };
 
-    if let Err(error) = agnostic_orderbook::instruction::cancel_order::process(
-        program_id,
-        invoke_accounts,
-        invoke_params,
-    ) {
-        error.print::<AoError>();
-        return Err(DexError::AOBError.into());
-    }
+    let mut order_summary = match asset_agnostic_orderbook::instruction::cancel_order::process::<
+        CallBackInfo,
+    >(program_id, invoke_accounts, invoke_params)
+    {
+        Err(error) => {
+            error.print::<AoError>();
+            return Err(DexError::AOBError.into());
+        }
+        Ok(s) => s,
+    };
+    let side = get_side_from_order_id(order_id);
 
-    let event_queue_header =
-        EventQueueHeader::deserialize(&mut (&accounts.event_queue.data.borrow() as &[u8]))?;
-    let event_queue = EventQueue::new(
-        event_queue_header,
-        Rc::clone(&accounts.event_queue.data),
-        CALLBACK_INFO_LEN as usize,
-    );
-
-    let order_summary: OrderSummary = event_queue.read_register().unwrap().unwrap();
-
-    let side = get_side_from_order_id(*order_id);
+    market_state
+        .unscale_order_summary(&mut order_summary)
+        .unwrap();
 
     match side {
         Side::Bid => {
@@ -191,7 +196,7 @@ pub(crate) fn process(
         }
     };
 
-    user_account.remove_order(*order_index as usize)?;
+    user_account.remove_order(order_index as usize)?;
 
     Ok(())
 }

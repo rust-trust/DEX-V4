@@ -1,7 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import { DEX_ID } from "./ids";
-import { Order, UserAccount } from "./state";
+import { MarketState, Order, UserAccount } from "./state";
 import { closeAccount, initializeAccount } from "./bindings";
 
 /**
@@ -155,11 +155,17 @@ export class OpenOrders {
   static async load(
     connection: Connection,
     market: PublicKey,
-    owner: PublicKey
+    owner: PublicKey,
+    marketState?: MarketState,
+    programId = DEX_ID
   ) {
+    if (!marketState) {
+      marketState = await MarketState.retrieve(connection, market);
+    }
+
     const [address] = await PublicKey.findProgramAddress(
       [market.toBuffer(), owner.toBuffer()],
-      DEX_ID
+      programId
     );
 
     const userAccount = await UserAccount.retrieve(connection, address);
@@ -187,17 +193,18 @@ export class OpenOrders {
   static async makeCreateAccountTransaction(
     market: PublicKey,
     owner: PublicKey,
-    maxOrders = 20
+    maxOrders = 20,
+    programId = DEX_ID
   ) {
-    return await initializeAccount(market, owner, maxOrders);
+    return await initializeAccount(market, owner, maxOrders, undefined, programId);
   }
 
   /**
    *
    * @returns Returns a TransactionInstruction object to close the OpenOrder account
    */
-  async makeCloseAccountTransaction() {
-    return await closeAccount(this.market, this.owner);
+  async makeCloseAccountTransaction(programId = DEX_ID) {
+    return await closeAccount(this.market, this.owner, programId);
   }
 
   /**
@@ -210,20 +217,25 @@ export class OpenOrders {
   static async exists(
     connection: Connection,
     market: PublicKey,
-    owner: PublicKey
+    owner: PublicKey,
+    programId = DEX_ID
   ) {
     const [address] = await PublicKey.findProgramAddress(
       [market.toBuffer(), owner.toBuffer()],
-      DEX_ID
+      programId
     );
     const info = await connection.getAccountInfo(address);
     return !!info?.data;
   }
 
-  static async addressForOwner(market: PublicKey, owner: PublicKey) {
+  static async addressForOwner(
+    market: PublicKey,
+    owner: PublicKey,
+    programId = DEX_ID
+  ) {
     const [address] = await PublicKey.findProgramAddress(
       [market.toBuffer(), owner.toBuffer()],
-      DEX_ID
+      programId
     );
     return address;
   }

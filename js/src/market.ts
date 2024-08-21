@@ -5,13 +5,13 @@ import {
   Keypair,
   Transaction,
   TransactionSignature,
-  TransactionInstruction,
+  TransactionInstruction
 } from "@solana/web3.js";
 import {
   getMintDecimals,
-  findAssociatedTokenAddress,
   getTokenBalance,
   divideBnToNumber,
+  computeUiPrice
 } from "./utils";
 import { CALLBACK_INFO_LEN, MarketState, SelfTradeBehavior } from "./state";
 import { DEX_ID, SRM_MINT, MSRM_MINT } from "./ids";
@@ -19,14 +19,15 @@ import {
   EventQueue,
   getPriceFromKey,
   MarketState as AaobMarketState,
-  Slab,
+  Slab
 } from "@bonfida/aaob";
 import { getFeeTier } from "./fees";
 import { OpenOrders } from "./openOrders";
 import { cancelOrder, placeOrder, settle } from "./bindings";
 import BN from "bn.js";
-import { Order, OrderType, Side, OrderInfo, MarketOptions } from "./types";
+import { OrderType, Side, OrderInfo, MarketOptions } from "./types";
 import { Orderbook } from "./orderbook";
+import { getAssociatedTokenAddress } from "@solana/spl-token";
 
 /**
  * A Serum DEX Market object
@@ -103,7 +104,12 @@ export class Market {
   private _commitment: Commitment;
 
   private _tickSize: number;
+  private _tickSizeBN: BN;
   private _minOrderSize: number;
+  private _minOrderSizeBN: BN;
+  private _admin: PublicKey;
+  private _baseCurrencyMultiplier: BN;
+  private _quoteCurrencyMultiplier: BN;
 
   constructor(
     marketState: MarketState,
@@ -132,8 +138,15 @@ export class Market {
     this._orderbookAddress = orderbookAddress;
     this._baseSplTokenMultiplier = new BN(10).pow(new BN(baseDecimals));
     this._quoteSplTokenMultiplier = new BN(10).pow(new BN(quoteDecimals));
-    this._tickSize = Math.pow(10, -quoteDecimals);
-    this._minOrderSize = marketState.minBaseOrderSize.toNumber();
+    this._baseCurrencyMultiplier = marketState.baseCurrencyMultiplier;
+    this._quoteCurrencyMultiplier = marketState.quoteCurrencyMultiplier;
+    this._tickSize = computeUiPrice(this, orderbookState.tickSize);
+    this._tickSizeBN = orderbookState.tickSize;
+    this._minOrderSize = this.baseSplSizeToNumber(
+      orderbookState.minBaseOrderSize
+    );
+    this._minOrderSizeBN = marketState.minBaseOrderSize;
+    this._admin = marketState.admin;
   }
 
   /**
@@ -154,12 +167,13 @@ export class Market {
 
     const orderbookState = await AaobMarketState.retrieve(
       connection,
-      marketState.orderbook
+      marketState.orderbook,
+      CALLBACK_INFO_LEN
     );
 
     const [baseDecimals, quoteDecimals] = await Promise.all([
       getMintDecimals(connection, marketState.baseMint),
-      getMintDecimals(connection, marketState.quoteMint),
+      getMintDecimals(connection, marketState.quoteMint)
     ]);
 
     return new Market(
@@ -252,9 +266,31 @@ export class Market {
     return this._tickSize;
   }
 
+  /** Returns the big number tick size of the market */
+  get tickSizeBN(): BN {
+    return this._tickSizeBN;
+  }
+
   /** Returns the min order size of the market */
   get minOrderSize(): number {
     return this._minOrderSize;
+  }
+
+  /** Returns the big number min order size of the market */
+  get minOrderSizeBN(): BN {
+    return this._minOrderSizeBN;
+  }
+
+  get marketAdmin(): PublicKey {
+    return this._admin;
+  }
+
+  get baseCurrencyMultiplier(): BN {
+    return this._baseCurrencyMultiplier;
+  }
+
+  get quoteCurrencyMultiplier(): BN {
+    return this._quoteCurrencyMultiplier;
   }
 
   /** Returns the inception base volume */
@@ -308,13 +344,19 @@ export class Market {
    * @param owner The owner of the orders to fetch
    * @returns
    */
-  async loadOrdersForOwner(connection: Connection, owner: PublicKey) {
+  async loadOrdersForOwner(
+    connection: Connection,
+    owner: PublicKey,
+    convertPriceAndSizeToNumber: boolean = true,
+    programId: PublicKey = DEX_ID
+    ) {
     const openOrders = await this.findOpenOrdersAccountForOwner(
       connection,
-      owner
+      owner,
+      programId
     );
     const orderbook = await Orderbook.load(connection, this.address);
-    return this.filterForOpenOrders(orderbook, openOrders);
+    return this.filterForOpenOrders(orderbook, openOrders, convertPriceAndSizeToNumber);
   }
 
   /**
@@ -323,9 +365,9 @@ export class Market {
    * @returns The public key of the associated token account of the owner
    */
   async findBaseTokenAccountsForOwner(owner: PublicKey) {
-    const pubkey = await findAssociatedTokenAddress(
-      owner,
-      this._marketState.baseMint
+    const pubkey = await getAssociatedTokenAddress(
+      this._marketState.baseMint,
+      owner
     );
     return pubkey;
   }
@@ -336,7 +378,7 @@ export class Market {
    * @returns The public key of the associated token account of the owner
    */
   async findQuoteTokenAccountsForOwner(owner: PublicKey) {
-    const pubkey = await findAssociatedTokenAddress(
+    const pubkey = await getAssociatedTokenAddress(
       owner,
       this._marketState.quoteMint
     );
@@ -350,9 +392,16 @@ export class Market {
    */
   async findOpenOrdersAccountForOwner(
     connection: Connection,
-    owner: PublicKey
+    owner: PublicKey,
+    programId: PublicKey = DEX_ID
   ) {
-    const openOrders = OpenOrders.load(connection, this.address, owner);
+    const openOrders = OpenOrders.load(
+      connection,
+      this.address,
+      owner,
+      this._marketState,
+      programId
+    );
     return openOrders;
   }
 
@@ -378,7 +427,7 @@ export class Market {
     selfTradeBehavior: SelfTradeBehavior,
     ownerTokenAccount: PublicKey,
     owner: Keypair,
-    clientOrderId: BN,
+    clientOrderId?: BN,
     discountTokenAccount?: PublicKey
   ) {
     const inst = await this.makePlaceOrderTransaction(
@@ -416,7 +465,7 @@ export class Market {
     selfTradeBehavior: SelfTradeBehavior,
     ownerTokenAccount: PublicKey,
     owner: PublicKey,
-    clientOrderId: BN,
+    clientOrderId?: BN,
     discountTokenAccount?: PublicKey
   ) {
     return await placeOrder(
@@ -441,7 +490,7 @@ export class Market {
    */
   async findFeeDiscountKeys(connection: Connection, owner: PublicKey) {
     const [srmAddress, msrmAddress] = await Promise.all(
-      [SRM_MINT, MSRM_MINT].map((e) => findAssociatedTokenAddress(owner, e))
+      [SRM_MINT, MSRM_MINT].map((e) => getAssociatedTokenAddress(e, owner))
     );
     const [srmBalance, msrmBalance] = await Promise.all(
       [srmAddress, msrmAddress].map((e) => getTokenBalance(connection, e))
@@ -451,14 +500,14 @@ export class Market {
         pubkey: srmAddress,
         mint: SRM_MINT,
         balance: srmBalance,
-        feeTier: getFeeTier(0, srmBalance),
+        feeTier: getFeeTier(0, srmBalance)
       },
       {
         pubkey: msrmAddress,
         mint: MSRM_MINT,
         balance: msrmBalance,
-        feeTier: getFeeTier(msrmBalance, 0),
-      },
+        feeTier: getFeeTier(msrmBalance, 0)
+      }
     ];
   }
 
@@ -475,7 +524,7 @@ export class Market {
     signers: Array<Keypair>
   ): Promise<TransactionSignature> {
     const signature = await connection.sendTransaction(transaction, signers, {
-      skipPreflight: this._skipPreflight,
+      skipPreflight: this._skipPreflight
     });
     const { value } = await connection.confirmTransaction(
       signature,
@@ -498,7 +547,7 @@ export class Market {
     orderId: BN,
     owner: PublicKey
   ) {
-    const instruction = await cancelOrder(this, orderIndex, orderId, owner);
+    const instruction = await cancelOrder(this, owner, orderId, orderIndex);
     const tx = new Transaction().add(instruction);
     return tx;
   }
@@ -513,12 +562,15 @@ export class Market {
   async cancelOrderByOrderIndex(
     connection: Connection,
     orderIndex: number,
-    owner: Keypair
+    owner: Keypair,
+    programId: PublicKey = DEX_ID
   ) {
     const openOrders = await OpenOrders.load(
       connection,
       this.address,
-      owner.publicKey
+      owner.publicKey,
+      this._marketState,
+      programId
     );
     const orderId = openOrders.orders[orderIndex].id;
     if (!orderId) {
@@ -543,12 +595,15 @@ export class Market {
   async cancelOrderByOrderId(
     connection: Connection,
     orderId: BN,
-    owner: Keypair
+    owner: Keypair,
+    programId: PublicKey = DEX_ID
   ) {
     const openOrders = await OpenOrders.load(
       connection,
       this.address,
-      owner.publicKey
+      owner.publicKey,
+      this._marketState,
+      programId
     );
     const orderIndex = openOrders.orders
       .map((o) => o.id.eq(orderId))
@@ -576,9 +631,9 @@ export class Market {
       instr.push(
         await cancelOrder(
           this,
-          new BN(o.orderIndex),
+          owner.publicKey,
           o.orderId,
-          owner.publicKey
+          new BN(o.orderIndex)
         )
       );
     }
@@ -662,23 +717,21 @@ export class Market {
    * @param openOrders Open orders account
    * @returns
    */
-  filterForOpenOrdersFromSlab(slab: Slab, openOrders: OpenOrders, side: Side) {
+  filterForOpenOrdersFromSlab(slab: Slab, openOrders: OpenOrders, side: Side, convertPriceAndSizeToNumber: boolean = true) {
     return [...slab]
       .filter((o) =>
-        openOrders?.address.equals(
-          new PublicKey(slab.getCallBackInfo(o.callBackInfoPt).slice(0, 32))
-        )
+        openOrders?.address.equals(new PublicKey(o.callbackInfo.slice(0, 32)))
       )
       .map((o) => {
+        const priceBN = getPriceFromKey(o.leafNode.key);
+        const sizeBN = o.leafNode.baseQuantity;
         return {
-          orderId: o.key,
-          price: getPriceFromKey(o.key).toNumber(),
-          feeTier: slab.getCallBackInfo(o.callBackInfoPt).slice(32)[0],
-          size: o.baseQuantity.toNumber(),
-          openOrdersAddress: new PublicKey(
-            slab.getCallBackInfo(o.callBackInfoPt).slice(0, 32)
-          ),
-          side: side,
+          orderId: o.leafNode.key,
+          price: convertPriceAndSizeToNumber ? priceBN.toNumber() : priceBN,
+          feeTier: o.callbackInfo.slice(32)[0],
+          size: convertPriceAndSizeToNumber ? sizeBN.toNumber() : sizeBN,
+          openOrdersAddress: new PublicKey(o.callbackInfo.slice(0, 32)),
+          side: side
         };
       });
   }
@@ -689,17 +742,39 @@ export class Market {
    * @param openOrder The openOrder that owns the orders
    * @returns
    */
-  filterForOpenOrders(orderbook: Orderbook, openOrder: OpenOrders) {
+  filterForOpenOrders(orderbook: Orderbook, openOrder: OpenOrders, convertPriceAndSizeToNumber: boolean = true) {
     const bids = this.filterForOpenOrdersFromSlab(
       orderbook.slabBids,
       openOrder,
-      Side.Bid
+      Side.Bid,
+      convertPriceAndSizeToNumber
     );
     const asks = this.filterForOpenOrdersFromSlab(
       orderbook.slabAsks,
       openOrder,
-      Side.Ask
+      Side.Ask,
+      convertPriceAndSizeToNumber
     );
     return [...bids, ...asks];
+  }
+
+  private _parseSlab(slab: Slab, depth: number, increasing: boolean) {
+    const parsed = slab.getL2DepthJS(depth, increasing);
+    return parsed.map((e) => {
+      return {
+        price: e.price
+          .mul(this.baseCurrencyMultiplier)
+          .div(this.quoteCurrencyMultiplier),
+        priceRaw: e.price,
+        size: e.size.mul(this.baseCurrencyMultiplier)
+      };
+    });
+  }
+
+  parseAsksSlab(slab: Slab, depth: number) {
+    return this._parseSlab(slab, depth, true);
+  }
+  parseBidsSlab(slab: Slab, depth: number) {
+    return this._parseSlab(slab, depth, false);
   }
 }

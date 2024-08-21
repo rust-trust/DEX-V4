@@ -2,12 +2,11 @@
 use crate::{
     error::DexError,
     state::{CallBackInfo, DexState, FeeTier, Order, UserAccount},
+    utils::check_account_owner,
     utils::{check_account_key, check_signer},
-    utils::{check_account_owner, fp32_mul},
 };
-use agnostic_orderbook::error::AoError;
-use agnostic_orderbook::state::read_register;
-use agnostic_orderbook::state::{OrderSummary, Side};
+use asset_agnostic_orderbook::error::AoError;
+use asset_agnostic_orderbook::state::Side;
 use bonfida_utils::BorshSize;
 use bonfida_utils::InstructionsAccount;
 use borsh::BorshDeserialize;
@@ -22,9 +21,7 @@ use solana_program::{
     program::{invoke, invoke_signed},
     program_error::{PrintProgramError, ProgramError},
     pubkey::Pubkey,
-    rent::Rent,
-    system_instruction, system_program,
-    sysvar::Sysvar,
+    system_program,
 };
 
 use super::REFERRAL_MASK;
@@ -35,6 +32,11 @@ use super::REFERRAL_MASK;
 The required arguments for a new_order instruction.
 */
 pub struct Params {
+    #[cfg(all(not(target_arch = "aarch64"), not(feature = "aarch64-test")))]
+    /// The client order id number that will be stored in the user account
+    pub client_order_id: u128,
+    #[cfg(any(target_arch = "aarch64", feature = "aarch64-test"))]
+    pub client_order_id: [u64; 2],
     /// The order's limit price (as a FP32)
     pub limit_price: u64,
     /// The max quantity of base token to match and post
@@ -45,7 +47,6 @@ pub struct Params {
     ///
     /// Setting this number too high can sometimes lead to excessive resource consumption which can cause a failure.
     pub match_limit: u64,
-    pub client_order_id: u128,
     /// The order's side (Bid or Ask)
     pub side: u8,
     /// The order type (supported types include Limit, FOK, IOC and PostOnly)
@@ -154,26 +155,29 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
             },
             fee_referral_account: next_account_info(accounts_iter).ok(),
         };
+
         check_signer(a.user_owner).map_err(|e| {
             msg!("The user account owner should be a signer for this transaction!");
             e
         })?;
+
         check_account_key(
             a.spl_token_program,
-            &spl_token::ID.to_bytes(),
+            &spl_token::ID,
             DexError::InvalidSplTokenProgram,
         )?;
         check_account_key(
             a.system_program,
-            &system_program::ID.to_bytes(),
+            &system_program::ID,
             DexError::InvalidSystemProgramAccount,
         )?;
+
         if let Some(discount_account) = a.discount_token_account {
             check_account_owner(
                 discount_account,
-                a.user_owner.key,
-                DexError::InvalidStateAccountOwner,
-            )?;
+                &spl_token::ID,
+                DexError::InvalidSplTokenProgram,
+            )?
         }
         check_account_owner(a.user, program_id, DexError::InvalidStateAccountOwner)?;
         check_account_owner(a.market, program_id, DexError::InvalidStateAccountOwner)?;
@@ -181,21 +185,24 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         Ok(a)
     }
 
-    pub fn load_user_account(&self) -> Result<UserAccount<'a>, ProgramError> {
-        let user_account = UserAccount::get(self.user)?;
-        if user_account.header.owner != self.user_owner.key.to_bytes() {
+    pub fn load_user_account(
+        &self,
+        user_account_data: &'a mut [u8],
+    ) -> Result<UserAccount<'a>, ProgramError> {
+        let user_account = UserAccount::from_buffer(user_account_data)?;
+        if &user_account.header.owner != self.user_owner.key {
             msg!("Invalid user account owner provided!");
             return Err(ProgramError::InvalidArgument);
         }
-        if user_account.header.market != self.market.key.to_bytes() {
+        if &user_account.header.market != self.market.key {
             msg!("The provided user account doesn't match the current market");
             return Err(ProgramError::InvalidArgument);
         };
-        if user_account.header.owner != self.user_owner.key.to_bytes() {
+        if &user_account.header.owner != self.user_owner.key {
             msg!("Invalid user account owner provided!");
             return Err(ProgramError::InvalidArgument);
         }
-        if user_account.header.market != self.market.key.to_bytes() {
+        if &user_account.header.market != self.market.key {
             msg!("The provided user account doesn't match the current market");
             return Err(ProgramError::InvalidArgument);
         };
@@ -218,12 +225,15 @@ pub(crate) fn process(
         match_limit,
         has_discount_token_account,
         client_order_id,
-        _padding: _,
+        ..
     } = try_from_bytes(instruction_data).map_err(|_| ProgramError::InvalidInstructionData)?;
+    #[cfg(any(target_arch = "aarch64", feature = "aarch64-test"))]
+    let client_order_id: &u128 = bytemuck::cast_ref(client_order_id);
     let accounts = Accounts::parse(program_id, accounts, *has_discount_token_account != 0)?;
 
     let market_state = DexState::get(accounts.market)?;
-    let mut user_account = accounts.load_user_account()?;
+    let mut user_account_data = accounts.user.data.borrow_mut();
+    let mut user_account = accounts.load_user_account(&mut user_account_data)?;
 
     // Check the order size
     if max_base_qty < &market_state.min_base_order_size {
@@ -251,69 +261,55 @@ pub(crate) fn process(
         max_quote_qty = fee_tier.remove_taker_fee(max_quote_qty);
     }
 
-    let orderbook = agnostic_orderbook::state::MarketState::get(accounts.orderbook)?;
-
-    //Transfer the cranking fee to the AAOB program
-    let rent = Rent::get()?;
-    if accounts.user_owner.lamports()
-        < rent.minimum_balance(accounts.user_owner.data_len()) + orderbook.cranker_reward
-    {
-        msg!("The user does not have enough lamports on his account.");
-        return Err(DexError::OutofFunds.into());
-    }
-    let transfer_cranking_fee = system_instruction::transfer(
-        accounts.user_owner.key,
-        accounts.orderbook.key,
-        orderbook.cranker_reward,
-    );
-    drop(orderbook);
-    invoke(
-        &transfer_cranking_fee,
-        &[
-            accounts.system_program.clone(),
-            accounts.user_owner.clone(),
-            accounts.orderbook.clone(),
-        ],
-    )?;
-
-    let invoke_params = agnostic_orderbook::instruction::new_order::Params {
-        max_base_qty: *max_base_qty,
-        max_quote_qty,
+    let invoke_params = asset_agnostic_orderbook::instruction::new_order::Params {
+        max_base_qty: market_state.scale_base_amount(*max_base_qty),
+        max_quote_qty: market_state.scale_quote_amount(max_quote_qty),
         limit_price: *limit_price,
         side: FromPrimitive::from_u8(*side).unwrap(),
         match_limit: *match_limit,
-        callback_info: callback_info.try_to_vec()?,
+        callback_info,
         post_only,
         post_allowed,
         self_trade_behavior: FromPrimitive::from_u8(*self_trade_behavior).unwrap(),
     };
-    let invoke_accounts = agnostic_orderbook::instruction::new_order::Accounts {
+    let invoke_accounts = asset_agnostic_orderbook::instruction::new_order::Accounts {
         market: accounts.orderbook,
         event_queue: accounts.event_queue,
         bids: accounts.bids,
         asks: accounts.asks,
     };
 
-    if let Err(error) = agnostic_orderbook::instruction::new_order::process(
+    let mut order_summary = match asset_agnostic_orderbook::instruction::new_order::process(
         program_id,
         invoke_accounts,
         invoke_params,
     ) {
-        error.print::<AoError>();
-        return Err(DexError::AOBError.into());
-    }
+        Err(error) => {
+            error.print::<AoError>();
+            return Err(DexError::AOBError.into());
+        }
+        Ok(s) => s,
+    };
 
-    let mut order_summary: OrderSummary = read_register(accounts.event_queue).unwrap().unwrap();
+    market_state
+        .unscale_order_summary(&mut order_summary)
+        .unwrap();
+
+    let posted_quote_qty = market_state
+        .get_quote_from_base(order_summary.total_base_qty_posted, *limit_price)
+        .unwrap();
 
     let (qty_to_transfer, transfer_destination, referral_fee) =
         match FromPrimitive::from_u8(*side).unwrap() {
             Side::Bid => {
                 // We update the order summary to properly handle the FOK order type
-                let posted_quote_qty =
-                    fp32_mul(order_summary.total_base_qty_posted, *limit_price).unwrap();
                 let matched_quote_qty = order_summary.total_quote_qty - posted_quote_qty;
                 let taker_fee = fee_tier.taker_fee(matched_quote_qty);
-                order_summary.total_quote_qty += taker_fee;
+                let royalties_fees = matched_quote_qty
+                    .checked_mul(market_state.royalties_bps)
+                    .unwrap()
+                    / 10_000;
+                order_summary.total_quote_qty += taker_fee + royalties_fees;
                 let referral_fee = fee_tier.referral_fee(matched_quote_qty);
                 let q = order_summary
                     .total_quote_qty
@@ -323,8 +319,11 @@ pub(crate) fn process(
                     .quote_token_free
                     .saturating_sub(order_summary.total_quote_qty);
                 user_account.header.quote_token_locked += posted_quote_qty;
-                user_account.header.base_token_free +=
-                    order_summary.total_base_qty - order_summary.total_base_qty_posted;
+                user_account.header.base_token_free = order_summary
+                    .total_base_qty
+                    .checked_sub(order_summary.total_base_qty_posted)
+                    .and_then(|n| n.checked_add(user_account.header.base_token_free))
+                    .unwrap();
 
                 (q, accounts.quote_vault, referral_fee)
             }
@@ -337,12 +336,17 @@ pub(crate) fn process(
                     .base_token_free
                     .saturating_sub(order_summary.total_base_qty);
                 user_account.header.base_token_locked += order_summary.total_base_qty_posted;
-                let posted_quote_qty =
-                    fp32_mul(order_summary.total_base_qty_posted, *limit_price).unwrap();
                 let taken_quote_qty = order_summary.total_quote_qty - posted_quote_qty;
                 let taker_fee = fee_tier.taker_fee(taken_quote_qty);
+                let royalties_fees = taken_quote_qty
+                    .checked_mul(market_state.royalties_bps)
+                    .unwrap()
+                    / 10_000;
                 let referral_fee = fee_tier.referral_fee(taken_quote_qty);
-                user_account.header.quote_token_free += taken_quote_qty - taker_fee;
+                user_account.header.quote_token_free = taken_quote_qty
+                    .checked_sub(taker_fee + royalties_fees)
+                    .and_then(|n| n.checked_add(user_account.header.quote_token_free))
+                    .unwrap();
                 (q, accounts.base_vault, referral_fee)
             }
         };
@@ -425,7 +429,7 @@ pub(crate) fn process(
         .saturating_sub(order_summary.total_base_qty_posted);
     user_account.header.accumulated_taker_quote_volume += order_summary
         .total_quote_qty
-        .saturating_sub(fp32_mul(order_summary.total_base_qty_posted, *limit_price).unwrap());
+        .saturating_sub(posted_quote_qty);
 
     Ok(())
 }

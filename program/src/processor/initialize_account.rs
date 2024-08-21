@@ -30,7 +30,7 @@ The required arguments for a initialize_account instruction.
 */
 pub struct Params {
     /// The user account's parent market
-    pub market: [u8; 32],
+    pub market: Pubkey,
     /// The maximum number of orders the user account may hold
     pub max_orders: u64,
 }
@@ -71,7 +71,7 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         })?;
         check_account_key(
             a.system_program,
-            &system_program::ID.to_bytes(),
+            &system_program::ID,
             DexError::InvalidSystemProgramAccount,
         )?;
         check_account_owner(
@@ -94,8 +94,11 @@ pub(crate) fn process(
     let Params { market, max_orders } =
         try_from_bytes(instruction_data).map_err(|_| ProgramError::InvalidInstructionData)?;
 
-    let (user_account_key, user_account_nonce) =
-        Pubkey::find_program_address(&[market, &accounts.user_owner.key.to_bytes()], program_id);
+    let market_key_bytes = market.to_bytes();
+    let (user_account_key, user_account_nonce) = Pubkey::find_program_address(
+        &[&market_key_bytes, &accounts.user_owner.key.to_bytes()],
+        program_id,
+    );
 
     if &user_account_key != accounts.user.key {
         msg!("Provided an invalid user account for the specified market and owner");
@@ -106,7 +109,12 @@ pub(crate) fn process(
         msg!("The minimum number of orders an account should be able to hold is 1");
         return Err(ProgramError::InvalidArgument);
     }
-    let space = (USER_ACCOUNT_HEADER_LEN as u64) + max_orders * (Order::LEN as u64);
+
+    // (USER_ACCOUNT_HEADER_LEN as u64) + max_orders * (Order::LEN as u64);
+    let space = max_orders
+        .checked_mul(Order::LEN as u64)
+        .and_then(|n| n.checked_add(USER_ACCOUNT_HEADER_LEN as u64))
+        .ok_or(DexError::NumericalOverflow)?;
 
     let lamports = Rent::get()?.minimum_balance(space as usize);
 
@@ -126,14 +134,16 @@ pub(crate) fn process(
             accounts.user.clone(),
         ],
         &[&[
-            market,
+            &market_key_bytes,
             &accounts.user_owner.key.to_bytes(),
             &[user_account_nonce],
         ]],
     )?;
-    let mut u = UserAccount::get_unchecked(accounts.user);
 
-    *(u.header) = UserAccountHeader::new(&Pubkey::new(market), accounts.user_owner.key);
+    let mut user_account_data = accounts.user.data.borrow_mut();
+    let u = UserAccount::from_buffer_unchecked(&mut user_account_data)?;
+
+    *(u.header) = UserAccountHeader::new(market, accounts.user_owner.key);
 
     Ok(())
 }

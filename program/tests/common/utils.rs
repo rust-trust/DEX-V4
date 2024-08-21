@@ -1,13 +1,14 @@
-use agnostic_orderbook::state::{MARKET_STATE_LEN, REGISTER_SIZE};
-use dex_v4::CALLBACK_INFO_LEN;
+use asset_agnostic_orderbook::state::event_queue::EventQueue;
+use asset_agnostic_orderbook::state::market_state::MarketState;
+use dex_v4::state::CallBackInfo;
 use solana_program::instruction::Instruction;
 use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction::create_account;
-use solana_program_test::BanksClientError;
-use solana_program_test::{ProgramTest, ProgramTestContext};
+use solana_program_test::{BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::account::Account;
 use solana_sdk::signature::Signer;
+use solana_sdk::transport::TransportError;
 use solana_sdk::{signature::Keypair, transaction::Transaction};
 use spl_associated_token_account::{create_associated_token_account, get_associated_token_address};
 use spl_token::state::Mint;
@@ -23,6 +24,7 @@ pub async fn sign_send_instructions(
     for s in signers {
         payer_signers.push(s);
     }
+    let last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     transaction.partial_sign(&payer_signers, ctx.last_blockhash);
     ctx.banks_client.process_transaction(transaction).await
 }
@@ -91,12 +93,12 @@ pub async fn create_aob_market_and_accounts(
 
     // Create market state account
     let market_account = Keypair::new();
-    let aob_market_rent = rent.minimum_balance(MARKET_STATE_LEN);
+    let aob_market_rent = rent.minimum_balance(8 + MarketState::LEN);
     let create_market_account_instruction = create_account(
         &prg_test_ctx.payer.pubkey(),
         &market_account.pubkey(),
         aob_market_rent,
-        agnostic_orderbook::state::MARKET_STATE_LEN as u64,
+        8 + MarketState::LEN as u64,
         &dex_program_id,
     );
     sign_send_instructions(
@@ -109,9 +111,7 @@ pub async fn create_aob_market_and_accounts(
 
     // Create event queue account
     let event_queue_account = Keypair::new();
-    let evq_space = agnostic_orderbook::state::EVENT_QUEUE_HEADER_LEN
-        + REGISTER_SIZE
-        + 10 * (agnostic_orderbook::state::Event::compute_slot_size(CALLBACK_INFO_LEN as usize));
+    let evq_space = EventQueue::<CallBackInfo>::compute_allocation_size(10);
     let create_event_queue_account_instruction = create_account(
         &prg_test_ctx.payer.pubkey(),
         &event_queue_account.pubkey(),
@@ -129,11 +129,15 @@ pub async fn create_aob_market_and_accounts(
 
     // Create bids account
     let bids_account = Keypair::new();
+    let slab_space =
+        asset_agnostic_orderbook::state::critbit::Slab::<CallBackInfo>::compute_allocation_size(
+            1_000,
+        );
     let create_bids_account_instruction = create_account(
         &prg_test_ctx.payer.pubkey(),
         &bids_account.pubkey(),
-        rent.minimum_balance(1_000_000),
-        1_000_000,
+        rent.minimum_balance(slab_space),
+        slab_space as u64,
         &dex_program_id,
     );
     sign_send_instructions(
@@ -149,8 +153,8 @@ pub async fn create_aob_market_and_accounts(
     let create_asks_account_instruction = create_account(
         &prg_test_ctx.payer.pubkey(),
         &asks_account.pubkey(),
-        rent.minimum_balance(1_000_000),
-        1_000_000,
+        rent.minimum_balance(slab_space),
+        slab_space as u64,
         &dex_program_id,
     );
     sign_send_instructions(

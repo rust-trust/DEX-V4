@@ -81,7 +81,7 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         })?;
         check_account_key(
             a.spl_token_program,
-            &spl_token::ID.to_bytes(),
+            &spl_token::ID,
             DexError::InvalidSplTokenProgram,
         )?;
         check_account_owner(a.market, program_id, DexError::InvalidStateAccountOwner)?;
@@ -90,13 +90,16 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         Ok(a)
     }
 
-    pub fn load_user_account(&self) -> Result<UserAccount<'a>, ProgramError> {
-        let user_account = UserAccount::get(self.user)?;
-        if user_account.header.owner != self.user_owner.key.to_bytes() {
+    pub fn load_user_account(
+        &self,
+        user_account_data: &'a mut [u8],
+    ) -> Result<UserAccount<'a>, ProgramError> {
+        let user_account = UserAccount::from_buffer(user_account_data)?;
+        if &user_account.header.owner != self.user_owner.key {
             msg!("Invalid user account owner provided!");
             return Err(ProgramError::InvalidArgument);
         }
-        if user_account.header.market != self.market.key.to_bytes() {
+        if &user_account.header.market != self.market.key {
             msg!("The provided user account doesn't match the current market");
             return Err(ProgramError::InvalidArgument);
         };
@@ -109,13 +112,14 @@ pub(crate) fn process(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramR
 
     let market_state = DexState::get(accounts.market)?;
 
-    let mut user_account = accounts.load_user_account()?;
+    let mut user_account_data = accounts.user.data.borrow_mut();
+    let mut user_account = accounts.load_user_account(&mut user_account_data)?;
 
     check_accounts(program_id, &market_state, &accounts).unwrap();
 
     let transfer_quote_instruction = spl_token::instruction::transfer(
         &spl_token::ID,
-        &Pubkey::new(&market_state.quote_vault),
+        &market_state.quote_vault,
         accounts.destination_quote_account.key,
         accounts.market_signer.key,
         &[],
@@ -138,7 +142,7 @@ pub(crate) fn process(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramR
 
     let transfer_base_instruction = spl_token::instruction::transfer(
         &spl_token::ID,
-        &Pubkey::new(&market_state.base_vault),
+        &market_state.base_vault,
         accounts.destination_base_account.key,
         accounts.market_signer.key,
         &[],
@@ -179,7 +183,7 @@ fn check_accounts(
     )?;
     check_account_key(
         accounts.market_signer,
-        &market_signer.to_bytes(),
+        &market_signer,
         DexError::InvalidMarketSignerAccount,
     )?;
     check_account_key(

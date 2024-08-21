@@ -5,7 +5,6 @@ use solana_program::{decode_error::DecodeError, program_error::ProgramError};
 
 pub type AoResult<T = ()> = Result<T, DexError>;
 
-//TODO clean-up
 #[derive(Clone, Debug, Error, FromPrimitive)]
 pub enum DexError {
     #[error("The given order index is invalid.")]
@@ -48,6 +47,16 @@ pub enum DexError {
     AOBError,
     #[error("Invalid sweep authority account provided")]
     InvalidSweepAuthority,
+    #[error("Numerical overflow")]
+    NumericalOverflow,
+    #[error("Invalid metadata account owner")]
+    InvalidMetadataOwner,
+    #[error("Invalid metadata account key")]
+    InvalidMetadataKey,
+    #[error("The event queue must be empty")]
+    EventQueueMustBeEmpty,
+    #[error("Event queue mismatch")]
+    EventQueueMismatch,
 }
 
 impl From<DexError> for ProgramError {

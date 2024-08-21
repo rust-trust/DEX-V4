@@ -1,7 +1,7 @@
 //! Close an inactive and empty user account
 use crate::{
     error::DexError,
-    state::UserAccount,
+    state::{AccountTag, UserAccount},
     utils::{check_account_owner, check_signer},
 };
 use bonfida_utils::BorshSize;
@@ -54,21 +54,17 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
 
         Ok(a)
     }
-
-    pub fn load_user_account(&self) -> Result<UserAccount<'a>, ProgramError> {
-        let user_account = UserAccount::get(self.user)?;
-        if user_account.header.owner != self.user_owner.key.to_bytes() {
-            msg!("Invalid user account owner provided!");
-            return Err(ProgramError::InvalidArgument);
-        };
-        Ok(user_account)
-    }
 }
 
 pub(crate) fn process(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts = Accounts::parse(program_id, accounts)?;
 
-    let user_account = accounts.load_user_account()?;
+    let mut user_account_data = accounts.user.data.borrow_mut();
+    let user_account = UserAccount::from_buffer(&mut user_account_data)?;
+    if &user_account.header.owner != accounts.user_owner.key {
+        msg!("Invalid user account owner provided!");
+        return Err(ProgramError::InvalidArgument);
+    };
 
     if user_account.header.number_of_orders != 0
         || user_account.header.quote_token_free != 0
@@ -77,6 +73,8 @@ pub(crate) fn process(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramR
         msg!("The user account cannot be closed as it has pending orders or unsettled funds");
         return Err(DexError::UserAccountStillActive.into());
     }
+
+    user_account.header.tag = AccountTag::Closed as u64;
 
     let mut lamports = accounts.user.lamports.borrow_mut();
     let mut target_lamports = accounts.target_lamports_account.lamports.borrow_mut();

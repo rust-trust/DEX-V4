@@ -8,12 +8,18 @@ export enum AccountTag {
   Initialized = 0,
   MarketState = 1,
   UserAccount = 2,
+  Close = 3,
 }
 
 export enum SelfTradeBehavior {
   DecrementTake = 0,
   CancelProvide = 1,
   AbortTransaction = 2,
+}
+
+export enum MarketFeeType {
+  Default = 0,
+  Stable = 1,
 }
 
 export class MarketState {
@@ -29,6 +35,10 @@ export class MarketState {
   quoteVolume: BN;
   accumulatedFees: BN;
   minBaseOrderSize: BN;
+  royaltiesBps: BN;
+  accumulatedRoyalties: BN;
+  baseCurrencyMultiplier: BN;
+  quoteCurrencyMultiplier: BN;
   signerNonce: number;
   feeType: number;
 
@@ -50,6 +60,10 @@ export class MarketState {
           ["quoteVolume", "u64"],
           ["accumulatedFees", "u64"],
           ["minBaseOrderSize", "u64"],
+          ["royaltiesBps", "u64"],
+          ["accumulatedRoyalties", "u64"],
+          ["baseCurrencyMultiplier", "u64"],
+          ["quoteCurrencyMultiplier", "u64"],
           ["signerNonce", "u8"],
           ["feeType", "u8"],
           ["padding", [6]],
@@ -72,6 +86,10 @@ export class MarketState {
     quoteVolume: BN;
     accumulatedFees: BN;
     minBaseOrderSize: BN;
+    royaltiesBps: BN;
+    baseCurrencyMultiplier: BN;
+    quoteCurrencyMultiplier: BN;
+    accumulatedRoyalties: BN;
     feeType: number;
   }) {
     this.tag = obj.tag.toNumber() as AccountTag;
@@ -87,6 +105,10 @@ export class MarketState {
     this.quoteVolume = obj.quoteVolume;
     this.accumulatedFees = obj.accumulatedFees;
     this.minBaseOrderSize = obj.minBaseOrderSize;
+    this.royaltiesBps = obj.royaltiesBps;
+    this.accumulatedRoyalties = obj.accumulatedRoyalties;
+    this.quoteCurrencyMultiplier = obj.quoteCurrencyMultiplier;
+    this.baseCurrencyMultiplier = obj.baseCurrencyMultiplier;
     this.feeType = obj.feeType;
   }
 
@@ -144,7 +166,7 @@ export class UserAccount {
           ["quoteTokenLocked", "u64"],
           ["accumulatedRebates", "u64"],
           ["accumulatedMakerQuoteVolume", "u64"],
-          ["accumulatedMakerBaseeVolume", "u64"],
+          ["accumulatedMakerBaseVolume", "u64"],
           ["accumulatedTakerQuoteVolume", "u64"],
           ["accumulatedTakerBaseVolume", "u64"],
           ["_padding", "u32"],
@@ -199,11 +221,12 @@ export class UserAccount {
     if (!accountInfo?.data) {
       throw new Error("Invalid account provided");
     }
-    return deserializeUnchecked(
+    let u = deserializeUnchecked(
       this.schema,
       UserAccount,
       accountInfo.data
     ) as UserAccount;
+    return u;
   }
 
   getOrderId(clientOrderId: BN): BN | undefined {

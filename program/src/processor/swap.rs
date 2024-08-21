@@ -1,12 +1,10 @@
 use crate::{
     error::DexError,
     state::{CallBackInfo, DexState, FeeTier},
-    utils::check_account_owner,
-    utils::{check_account_key, check_signer},
+    utils::{check_account_key, check_account_owner, check_signer},
 };
-use agnostic_orderbook::error::AoError;
-use agnostic_orderbook::state::read_register;
-use agnostic_orderbook::state::{OrderSummary, SelfTradeBehavior, Side};
+use asset_agnostic_orderbook::state::{SelfTradeBehavior, Side};
+use asset_agnostic_orderbook::{error::AoError, state::AccountTag};
 use bonfida_utils::BorshSize;
 use bonfida_utils::InstructionsAccount;
 use borsh::BorshDeserialize;
@@ -21,9 +19,7 @@ use solana_program::{
     program::invoke_signed,
     program_error::{PrintProgramError, ProgramError},
     pubkey::Pubkey,
-    rent::Rent,
-    system_instruction, system_program,
-    sysvar::Sysvar,
+    system_program,
 };
 
 use super::REFERRAL_MASK;
@@ -143,20 +139,20 @@ impl<'a, 'b: 'a> Accounts<'a, AccountInfo<'b>> {
         })?;
         check_account_key(
             a.spl_token_program,
-            &spl_token::ID.to_bytes(),
+            &spl_token::ID,
             DexError::InvalidSplTokenProgram,
         )?;
         check_account_key(
             a.system_program,
-            &system_program::ID.to_bytes(),
+            &system_program::ID,
             DexError::InvalidSystemProgramAccount,
         )?;
         if let Some(discount_account) = a.discount_token_account {
             check_account_owner(
                 discount_account,
-                a.user_owner.key,
-                DexError::InvalidStateAccountOwner,
-            )?;
+                &spl_token::ID,
+                DexError::InvalidSplTokenProgram,
+            )?
         }
         check_account_owner(a.market, program_id, DexError::InvalidStateAccountOwner)?;
 
@@ -202,74 +198,74 @@ pub(crate) fn process(
         quote_qty = fee_tier.remove_taker_fee(quote_qty);
     }
 
-    let orderbook = agnostic_orderbook::state::MarketState::get(accounts.orderbook)?;
-
-    // Transfer the cranking fee to the AAOB program
-    let rent = Rent::get()?;
-    if accounts.user_owner.lamports()
-        < rent.minimum_balance(accounts.user_owner.data_len()) + orderbook.cranker_reward
-    {
-        msg!("The user does not have enough lamports on his account.");
-        return Err(DexError::OutofFunds.into());
-    }
-    let transfer_cranking_fee = system_instruction::transfer(
-        accounts.user_owner.key,
-        accounts.orderbook.key,
-        orderbook.cranker_reward,
-    );
-    drop(orderbook);
-    invoke(
-        &transfer_cranking_fee,
-        &[
-            accounts.system_program.clone(),
-            accounts.user_owner.clone(),
-            accounts.orderbook.clone(),
-        ],
+    let mut orderbook_guard = accounts.orderbook.data.borrow_mut();
+    let orderbook = asset_agnostic_orderbook::state::market_state::MarketState::from_buffer(
+        &mut orderbook_guard,
+        AccountTag::Market,
     )?;
+    let tick_size = orderbook.tick_size;
+    drop(orderbook_guard);
 
-    let (max_base_qty, max_quote_qty, limit_price) = match FromPrimitive::from_u8(*side).unwrap() {
-        Side::Bid => (u64::MAX, quote_qty, u64::MAX),
-        Side::Ask => (*base_qty, u64::MAX, u64::MIN),
-    };
+    let (max_base_qty_scaled, max_quote_qty_scaled, limit_price) =
+        match FromPrimitive::from_u8(*side).unwrap() {
+            Side::Bid => (
+                u64::MAX,
+                market_state.scale_quote_amount(quote_qty),
+                u64::MAX - (u64::MAX % tick_size),
+            ),
+            Side::Ask => (market_state.scale_base_amount(*base_qty), u64::MAX, 0),
+        };
 
-    let invoke_params = agnostic_orderbook::instruction::new_order::Params {
-        max_base_qty,
-        max_quote_qty,
+    let invoke_params = asset_agnostic_orderbook::instruction::new_order::Params {
+        max_base_qty: max_base_qty_scaled,
+        max_quote_qty: max_quote_qty_scaled,
         limit_price,
         side: FromPrimitive::from_u8(*side).unwrap(),
         match_limit: *match_limit,
-        callback_info: callback_info.try_to_vec()?,
+        callback_info,
         post_only: false,
         post_allowed: false,
         // No impact as user is Pubkey::default()
         self_trade_behavior: SelfTradeBehavior::DecrementTake,
     };
-    let invoke_accounts = agnostic_orderbook::instruction::new_order::Accounts {
+    let invoke_accounts = asset_agnostic_orderbook::instruction::new_order::Accounts {
         market: accounts.orderbook,
         event_queue: accounts.event_queue,
         bids: accounts.bids,
         asks: accounts.asks,
     };
 
-    if let Err(error) = agnostic_orderbook::instruction::new_order::process(
+    let mut order_summary = match asset_agnostic_orderbook::instruction::new_order::process(
         program_id,
         invoke_accounts,
         invoke_params,
     ) {
-        error.print::<AoError>();
-        return Err(DexError::AOBError.into());
-    }
+        Err(error) => {
+            error.print::<AoError>();
+            return Err(DexError::AOBError.into());
+        }
+        Ok(s) => s,
+    };
 
-    let mut order_summary: OrderSummary = read_register(accounts.event_queue).unwrap().unwrap();
+    market_state
+        .unscale_order_summary(&mut order_summary)
+        .unwrap();
 
     let referral_fee = fee_tier.referral_fee(order_summary.total_quote_qty);
+    let royalties_fees = order_summary
+        .total_quote_qty
+        .checked_mul(market_state.royalties_bps)
+        .unwrap()
+        / 10_000;
     let (is_valid, base_transfer_qty, quote_transfer_qty) =
         match FromPrimitive::from_u8(*side).unwrap() {
             Side::Bid => {
                 // We update the order summary to properly handle the FOK order type
-                order_summary.total_quote_qty += fee_tier.taker_fee(order_summary.total_quote_qty);
 
-                let is_valid = order_summary.total_base_qty >= *base_qty;
+                order_summary.total_quote_qty +=
+                    fee_tier.taker_fee(order_summary.total_quote_qty) + royalties_fees;
+
+                let is_valid = &order_summary.total_base_qty >= base_qty;
 
                 (
                     is_valid,
@@ -285,7 +281,10 @@ pub(crate) fn process(
                 (
                     is_valid,
                     order_summary.total_base_qty,
-                    order_summary.total_quote_qty - taker_fee,
+                    order_summary
+                        .total_quote_qty
+                        .checked_sub(taker_fee + royalties_fees)
+                        .unwrap(),
                 )
             }
         };
@@ -402,7 +401,7 @@ fn check_accounts(
     )?;
     check_account_key(
         accounts.market_signer,
-        &market_signer.to_bytes(),
+        &market_signer,
         DexError::InvalidMarketSignerAccount,
     )?;
     check_account_key(

@@ -1,7 +1,7 @@
-import { Slab, SlabHeader } from "@bonfida/aaob";
+import { Slab } from "@bonfida/aaob";
 import { PublicKey, Connection } from "@solana/web3.js";
 import { Market } from "./market";
-import { throwIfNull } from "./utils";
+import { computeUiPrice, divideBnToNumber, throwIfNull } from "./utils";
 import * as aaob from "@bonfida/aaob";
 import { CALLBACK_INFO_LEN } from "./state";
 import BN from "bn.js";
@@ -60,11 +60,8 @@ export class Orderbook {
    */
   static async loadSlab(connection, slabAddress: PublicKey) {
     const { data } = throwIfNull(await connection.getAccountInfo(slabAddress));
-    const slab = aaob.Slab.deserialize(
-      data,
-      new BN(CALLBACK_INFO_LEN)
-    );
-    return slab
+    const slab = aaob.Slab.deserialize(data, CALLBACK_INFO_LEN);
+    return slab;
   }
 
   /**
@@ -88,11 +85,23 @@ export class Orderbook {
    * @param uiAmount Optional, whether to return the amounts in uiAmount
    * @returns Returns an L2 orderbook
    */
-  getL2(depth: number, asks: boolean, uiAmount?: boolean) {
+  getL2<T extends boolean>(
+    depth: number,
+    asks: boolean,
+    uiAmount: T
+  ): (T extends true ? UiPrice : aaob.Price)[];
+  getL2(
+    depth: number,
+    asks: boolean,
+    uiAmount = false
+  ): (UiPrice | aaob.Price)[] {
     const convert = (p: aaob.Price) => {
       return {
-        price: p.price,
-        size: p.size / Math.pow(10, this.market.baseDecimals),
+        price: computeUiPrice(this._market, p.price),
+        size: divideBnToNumber(
+          p.size,
+          new BN(10).pow(new BN(this.market.baseDecimals))
+        ),
       };
     };
     if (uiAmount) {
@@ -104,4 +113,9 @@ export class Orderbook {
       ? this._slabAsks.getL2DepthJS(depth, asks)
       : this._slabBids.getL2DepthJS(depth, asks);
   }
+}
+
+export interface UiPrice {
+  price: number;
+  size: number;
 }

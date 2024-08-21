@@ -1,10 +1,12 @@
 use std::convert::TryInto;
 
-use agnostic_orderbook::state::MarketState;
+use asset_agnostic_orderbook::state::market_state::MarketState;
+use asset_agnostic_orderbook::state::AccountTag;
 use bytemuck::try_from_bytes;
 use dex_v4::instruction_auto::initialize_account;
 use dex_v4::instruction_auto::new_order;
 use dex_v4::state::{DexState, DEX_STATE_LEN};
+use mpl_token_metadata::pda::find_metadata_account;
 use serum_dex::state::gen_vault_signer_key;
 use solana_program::instruction::Instruction;
 use solana_program::pubkey::Pubkey;
@@ -25,8 +27,6 @@ use crate::common::utils::sign_send_instructions;
 pub(crate) const NB_USER_ACCS: u32 = 10;
 
 pub struct AobDexTestContext {
-    pub aaob_program_id: Pubkey,
-    pub dex_program_id: Pubkey,
     pub dex_market_key: Pubkey,
     pub dex_market: DexState,
     pub aob_market: MarketState,
@@ -62,8 +62,6 @@ pub struct SerumMarket {
 /// Returns Dex market state pubkey, user account key, and test context
 pub async fn create_aob_dex(
     mut program_test: ProgramTest,
-    aaob_program_id: Pubkey,
-    dex_program_id: Pubkey,
 ) -> (AobDexTestContext, ProgramTestContext) {
     // Create the market mints
     let base_mint_auth = Keypair::new();
@@ -79,9 +77,9 @@ pub async fn create_aob_dex(
     let create_market_account_instruction = create_account(
         &pgr_test_ctx.payer.pubkey(),
         &market_account.pubkey(),
+        1_000_000_000_000,
         1_000_000,
-        1_000_000,
-        &dex_program_id,
+        &dex_v4::ID,
     );
     sign_send_instructions(
         &mut pgr_test_ctx,
@@ -93,10 +91,10 @@ pub async fn create_aob_dex(
 
     // Define the market signer
     let (market_signer, signer_nonce) =
-        Pubkey::find_program_address(&[&market_account.pubkey().to_bytes()], &dex_program_id);
+        Pubkey::find_program_address(&[&market_account.pubkey().to_bytes()], &dex_v4::ID);
 
     // Create the AAOB market with all accounts
-    let aaob_accounts = create_aob_market_and_accounts(&mut pgr_test_ctx, dex_program_id).await;
+    let aaob_accounts = create_aob_market_and_accounts(&mut pgr_test_ctx, dex_v4::ID).await;
 
     // Create the vault accounts
     let base_vault = create_associated_token(&mut pgr_test_ctx, &base_mint_key, &market_signer)
@@ -109,7 +107,7 @@ pub async fn create_aob_dex(
     // Create the dex market
     let market_admin = Keypair::new();
     let create_market_instruction = dex_v4::instruction_auto::create_market(
-        dex_program_id,
+        dex_v4::ID,
         dex_v4::instruction_auto::create_market::Accounts {
             base_vault: &base_vault,
             quote_vault: &quote_vault,
@@ -119,12 +117,14 @@ pub async fn create_aob_dex(
             event_queue: &aaob_accounts.event_queue,
             asks: &aaob_accounts.asks,
             bids: &aaob_accounts.bids,
+            token_metadata: &find_metadata_account(&base_mint_key).0,
         },
         dex_v4::instruction_auto::create_market::Params {
             signer_nonce: signer_nonce as u64,
             min_base_order_size: 1000,
             tick_size: 1,
-            cranker_reward: 0,
+            base_currency_multiplier: 1,
+            quote_currency_multiplier: 1,
         },
     );
     sign_send_instructions(&mut pgr_test_ctx, vec![create_market_instruction], vec![])
@@ -158,10 +158,10 @@ pub async fn create_aob_dex(
                 &market_account.pubkey().to_bytes(),
                 &user_account_owner.pubkey().to_bytes(),
             ],
-            &dex_program_id,
+            &dex_v4::ID,
         );
         let create_user_account_instruction = initialize_account(
-            dex_program_id,
+            dex_v4::ID,
             initialize_account::Accounts {
                 system_program: &system_program::ID,
                 user: &user_account,
@@ -169,7 +169,7 @@ pub async fn create_aob_dex(
                 fee_payer: &pgr_test_ctx.payer.pubkey(),
             },
             initialize_account::Params {
-                market: market_account.pubkey().to_bytes(),
+                market: market_account.pubkey(),
                 max_orders: 100,
             },
         );
@@ -241,22 +241,20 @@ pub async fn create_aob_dex(
         .unwrap()
         .data;
     let dex_market: &DexState = try_from_bytes(&dex_market_data[..DEX_STATE_LEN] as &[u8]).unwrap();
-    let aob_market_data = pgr_test_ctx
+    let mut aob_market_data = pgr_test_ctx
         .banks_client
         .get_account(aaob_accounts.market)
         .await
         .unwrap()
         .unwrap()
         .data;
-    let aob_market: MarketState = *try_from_bytes(&aob_market_data).unwrap();
+    let aob_market = MarketState::from_buffer(&mut aob_market_data, AccountTag::Market).unwrap();
 
     (
         AobDexTestContext {
-            aaob_program_id,
-            dex_program_id,
             dex_market_key: market_account.pubkey(),
             dex_market: *dex_market,
-            aob_market,
+            aob_market: *aob_market,
             user_account_keys,
             // user_account: user_account_header,
             user_owners,
@@ -307,14 +305,14 @@ pub async fn initialize_serum_market_accounts(
     // Create Vaults
     let coin_vault = create_associated_token(
         pgr_test_ctx,
-        &Pubkey::new(&aob_dex_test_ctx.dex_market.base_mint),
+        &aob_dex_test_ctx.dex_market.base_mint,
         &vault_signer_pk,
     )
     .await
     .unwrap();
     let pc_vault = create_associated_token(
         pgr_test_ctx,
-        &Pubkey::new(&aob_dex_test_ctx.dex_market.quote_mint),
+        &aob_dex_test_ctx.dex_market.quote_mint,
         &vault_signer_pk,
     )
     .await
@@ -323,8 +321,8 @@ pub async fn initialize_serum_market_accounts(
     let init_market_instruction = serum_dex::instruction::initialize_market(
         &market_key.pubkey(),
         &serum_dex_program_id,
-        &Pubkey::new(&aob_dex_test_ctx.dex_market.base_mint),
-        &Pubkey::new(&aob_dex_test_ctx.dex_market.quote_mint),
+        &aob_dex_test_ctx.dex_market.base_mint,
+        &aob_dex_test_ctx.dex_market.quote_mint,
         &coin_vault,
         &pc_vault,
         None,
@@ -352,8 +350,8 @@ pub async fn initialize_serum_market_accounts(
         vault_signer_nonce,
         coin_vault,
         pc_vault,
-        coin_mint: Pubkey::new(&aob_dex_test_ctx.dex_market.base_mint),
-        pc_mint: Pubkey::new(&aob_dex_test_ctx.dex_market.quote_mint),
+        coin_mint: aob_dex_test_ctx.dex_market.base_mint,
+        pc_mint: aob_dex_test_ctx.dex_market.quote_mint,
     };
     sign_send_instructions(pgr_test_ctx, vec![init_market_instruction], vec![])
         .await
@@ -401,30 +399,31 @@ pub fn create_serum_dex_account(
 pub async fn aob_dex_new_order(
     pgr_test_ctx: &mut ProgramTestContext,
     dex_test_ctx: &AobDexTestContext,
-    side: agnostic_orderbook::state::Side,
+    side: asset_agnostic_orderbook::state::Side,
     limit_price: u64,
     max_base_qty: u64,
     max_quote_qty: u64,
     user_account_index: usize,
-    dex_program_id: Pubkey,
 ) {
     // New Order on AOB DEX
     let new_order_instruction = new_order(
-        dex_program_id,
+        dex_v4::ID,
         new_order::Accounts {
             spl_token_program: &spl_token::ID,
             system_program: &system_program::ID,
             market: &dex_test_ctx.dex_market_key,
-            orderbook: &Pubkey::new(&dex_test_ctx.dex_market.orderbook),
-            event_queue: &Pubkey::new(&dex_test_ctx.aob_market.event_queue),
-            bids: &Pubkey::new(&dex_test_ctx.aob_market.bids),
-            asks: &Pubkey::new(&dex_test_ctx.aob_market.asks),
-            base_vault: &Pubkey::new(&dex_test_ctx.dex_market.base_vault),
-            quote_vault: &Pubkey::new(&dex_test_ctx.dex_market.quote_vault),
+            orderbook: &dex_test_ctx.dex_market.orderbook,
+            event_queue: &dex_test_ctx.aob_market.event_queue,
+            bids: &dex_test_ctx.aob_market.bids,
+            asks: &dex_test_ctx.aob_market.asks,
+            base_vault: &dex_test_ctx.dex_market.base_vault,
+            quote_vault: &dex_test_ctx.dex_market.quote_vault,
             user: &dex_test_ctx.user_account_keys[user_account_index],
             user_token_account: &match side {
-                agnostic_orderbook::state::Side::Ask => dex_test_ctx.user_bases[user_account_index],
-                agnostic_orderbook::state::Side::Bid => {
+                asset_agnostic_orderbook::state::Side::Ask => {
+                    dex_test_ctx.user_bases[user_account_index]
+                }
+                asset_agnostic_orderbook::state::Side::Bid => {
                     dex_test_ctx.user_quotes[user_account_index]
                 }
             },
@@ -438,9 +437,13 @@ pub async fn aob_dex_new_order(
             max_base_qty,
             max_quote_qty,
             order_type: new_order::OrderType::Limit as u8,
-            self_trade_behavior: agnostic_orderbook::state::SelfTradeBehavior::DecrementTake as u8,
+            self_trade_behavior: asset_agnostic_orderbook::state::SelfTradeBehavior::DecrementTake
+                as u8,
             match_limit: 10,
+            #[cfg(not(any(feature = "aarch64-test", target_arch = "aarch64")))]
             client_order_id: 0,
+            #[cfg(any(feature = "aarch64-test", target_arch = "aarch64"))]
+            client_order_id: bytemuck::cast(0u128),
             has_discount_token_account: false as u8,
             _padding: 0,
         },
